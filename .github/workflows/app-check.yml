@@ -1,0 +1,29 @@
+name: App check (shared)
+
+# Called from an app's own pr-check.yml: installs dependencies and runs the
+# app's self-test command. No secrets are passed, so it is safe on any PR.
+on:
+  workflow_call:
+    inputs:
+      run:
+        description: Self-test command, e.g. "npm run check"
+        type: string
+        required: true
+      workdir:
+        type: string
+        default: "."
+
+jobs:
+  app-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ${{ inputs.workdir }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: ${{ inputs.run }}
