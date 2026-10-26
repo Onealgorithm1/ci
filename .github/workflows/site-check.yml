@@ -1,0 +1,103 @@
+name: Site check (shared)
+
+# Called from each site's own .github/workflows/pr-check.yml.
+# Builds (optional), serves the site locally, crawls up to max_pages same-site
+# pages from "/" in WebKit (iPhone 15), Chromium (Pixel 7) and desktop 1440,
+# and fails on broken images, horizontal overflow or page errors.
+on:
+  workflow_call:
+    inputs:
+      build:
+        description: Build command; empty for a static site
+        type: string
+        default: ""
+      dir:
+        description: Folder to serve after the build
+        type: string
+        default: "."
+      spa:
+        description: Send unknown paths to index.html
+        type: boolean
+        default: false
+      max_pages:
+        type: number
+        default: 40
+
+jobs:
+  site-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    container: mcr.microsoft.com/playwright:v1.56.1-noble
+    steps:
+      - run: apt-get update -qq && apt-get install -y -qq git-lfs >/dev/null
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build
+        if: inputs.build != ''
+        run: ${{ inputs.build }}
+      - name: Fail on committed "Save page as" folders
+        run: |
+          found=$(find "${{ inputs.dir }}" -maxdepth 2 -type d -name '*_files' -not -path '*/node_modules/*' 2>/dev/null)
+          [ -z "$found" ] || { echo "::error::'Save page as' folder committed: $found"; exit 1; }
+      - name: Check pages
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+          MAX_PAGES: ${{ inputs.max_pages }}
+        run: |
+          mkdir -p /tmp/sc && cd /tmp/sc && npm init -y >/dev/null && npm i -s playwright@1.56.1 serve@14.2.4 wait-on@7.2.0 >/dev/null
+          cat > check.mjs <<'EOF'
+          import { webkit, chromium, devices } from 'playwright'
+          const base = 'http://localhost:4173', max = Number(process.env.MAX_PAGES || 40)
+          const IGNORE = /challenges\.cloudflare\.com|Blocked a frame with origin|ResizeObserver loop/i
+          const profiles = [['iPhone 15', webkit], ['Pixel 7', chromium], ['desktop', chromium]]
+          let fail = 0, checked = 0, paths = null
+          for (const [name, engine] of profiles) {
+            const browser = await engine.launch()
+            const ctx = name === 'desktop' ? await browser.newContext({ viewport: { width: 1440, height: 900 } })
+                                           : await browser.newContext({ ...devices[name] })
+            const page = await ctx.newPage(), errs = []
+            page.on('pageerror', e => { const s = String(e); if (!IGNORE.test(s)) errs.push(s.slice(0, 160)) })
+            if (!paths) {            // discover pages once, breadth-first from "/"
+              const seen = new Set(['/']), queue = ['/']
+              while (queue.length && seen.size < max) {
+                await page.goto(base + queue.shift(), { waitUntil: 'domcontentloaded' }).catch(() => {})
+                const links = await page.$$eval('a[href]', as => as.map(a => a.href)).catch(() => [])
+                for (const h of links) {
+                  const u = new URL(h, base)
+                  if (u.origin !== base || /\.(pdf|zip|png|jpe?g|webp|svg|xml|txt)$/i.test(u.pathname)) continue
+                  if (!seen.has(u.pathname) && seen.size < max) { seen.add(u.pathname); queue.push(u.pathname) }
+                }
+              }
+              paths = [...seen]
+              console.log(`checking ${paths.length} pages`)
+            }
+            for (const p of paths) {
+              checked++
+              const before = errs.length
+              const res = await page.goto(base + p, { waitUntil: 'domcontentloaded' }).catch(e => null)
+              await page.waitForTimeout(1200)
+              const broken = await page.$$eval('img', i => i.filter(x => x.complete && x.naturalWidth === 0 && !x.loading?.includes('lazy'))
+                                                         .map(x => x.getAttribute('src')).slice(0, 4)).catch(() => [])
+              const [sw, vw] = await page.evaluate(() => [document.documentElement.scrollWidth, innerWidth]).catch(() => [0, 0])
+              const status = res ? res.status() : 0
+              const bad = []
+              if (status >= 400 || status === 0) bad.push(`HTTP ${status}`)
+              if (broken.length) bad.push(`broken images: ${broken.join(', ')}`)
+              if (sw > vw + 2) bad.push(`horizontal overflow ${sw} > ${vw}`)
+              for (const e of errs.slice(before)) bad.push(`page error: ${e}`)
+              if (bad.length) { fail++; console.log(`FAIL  ${name}  ${p}\n      ${bad.join('\n      ')}`) }
+            }
+            await browser.close()
+          }
+          console.log(fail ? `FAILED — ${fail} of ${checked} page loads had problems`
+                           : `PASS — ${checked} page loads across iPhone/Pixel/desktop: no broken images, no overflow, no page errors`)
+          process.exit(fail ? 1 : 0)
+          EOF
+          SITE="$GITHUB_WORKSPACE/${{ inputs.dir }}"
+          npx serve "$SITE" -l 4173 ${{ inputs.spa && '-s' || '' }} >/dev/null 2>&1 &
+          npx wait-on http://localhost:4173 -t 60000
+          node check.mjs
