@@ -78,6 +78,11 @@ jobs:
             }
             for (const p of paths) {
               checked++
+              // Leave the previous page before counting. WebKit reports a download cut off by navigation as a page
+              // error ("Fetch API cannot load ... due to access control checks"), and it used to be counted against
+              // the NEXT page: phantom-arcades 2026-11-14, /designer's 3D model downloads blamed on /machines.
+              await page.goto('about:blank').catch(() => {})
+              await page.waitForTimeout(200)
               const before = errs.length
               const res = await page.goto(base + p, { waitUntil: 'domcontentloaded' }).catch(e => null)
               await page.waitForTimeout(1200)
